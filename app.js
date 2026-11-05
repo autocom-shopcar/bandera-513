@@ -149,7 +149,7 @@ async function api(ruta, opciones = {}) {
 async function rpc(nombre, args) {
   const r = await api(`/rest/v1/rpc/${nombre}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
   const j = r.status === 204 ? null : await r.json().catch(() => null);
-  if (!r.ok) throw new Error(j?.message || `Error ${r.status}`);
+  if (!r.ok) throw Object.assign(new Error(j?.message || `Error ${r.status}`), { code: j?.code, status: r.status });
   return j;
 }
 async function subirFoto(ruta, blob) {
@@ -161,11 +161,13 @@ async function subirFoto(ruta, blob) {
   throw new Error(j.message || j.error || `Error ${r.status} al subir la foto`);
 }
 const gpsCampos = (pre, g) => ({ [`${pre}_lat`]: g?.lat ?? null, [`${pre}_lon`]: g?.lon ?? null, [`${pre}_precision_m`]: g?.prec ?? null });
+// Pendiente de enviar, sea de quien sea: en el cambio de turno, quien retira puede no ser quien colocó.
 const pendiente = r => r.usuarioId && (!r.enviado?.colocacion || (r.retiro && !r.enviado?.retiro) || (r.cierre && !r.enviado?.cierre));
 
 async function enviarRegistro(r) {
   if (!r.enviado.colocacion) {
-    const ruta = `${r.usuarioId}/${r.remotoId}_colocacion.jpg`;
+    // La foto va en la carpeta de quien la envía (así lo pide Shop Car).
+    const ruta = `${sesion.usuarioId}/${r.remotoId}_colocacion.jpg`;
     await subirFoto(ruta, r.colocacion.foto);
     const viejo = !('via' in r);
     const res = await api('/rest/v1/banderas_azules', {
@@ -197,17 +199,11 @@ async function enviarRegistro(r) {
   if (r.retiro && !r.enviado.retiro) {
     const ruta = `${sesion.usuarioId}/${r.remotoId}_retiro.jpg`;
     await subirFoto(ruta, r.retiro.foto);
-    const res = await api(`/rest/v1/banderas_azules?id=eq.${r.remotoId}`, {
-      method: 'PATCH', headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-      body: JSON.stringify({
-        retirada_at: new Date(r.retiro.ms).toISOString(), retirada_responsable: r.retiro.responsable || 'Sin nombre',
-        ...gpsCampos('retirada', r.retiro.gps), foto_retiro: ruta,
-      }),
-    });
-    if (!res.ok) {
-      const j = await res.json().catch(() => ({}));
+    try {
+      await enviarRetiro(r, ruta);
+    } catch (err) {
       // Ya estaba retirada o cerrada sin retiro (otro intento sí llegó, o la cerró alguien más).
-      if (!/ya se registró como retirada|ya se cerró sin retiro/.test(j.message || '')) throw new Error(j.message || `Error ${res.status}`);
+      if (!/ya se registró como retirada|ya se cerró sin retiro/.test(err.message)) throw err;
     }
     r.enviado.retiro = true;
     await guardar(r);
@@ -223,7 +219,37 @@ async function enviarRegistro(r) {
   }
 }
 
+// El retiro se registra con retirar_bandera (cualquier usuario con rol puede retirar). Si Shop Car
+// aún no tiene esa función, se usa la actualización directa, pero confirmando que sí cambió la
+// bandera: antes, si la base no la encontraba o no dejaba, la app lo daba por enviado.
+async function enviarRetiro(r, ruta) {
+  const g = r.retiro.gps;
+  try {
+    await rpc('retirar_bandera', {
+      p_id: r.remotoId, p_retirada_at: new Date(r.retiro.ms).toISOString(), p_responsable: r.retiro.responsable || 'Sin nombre',
+      p_foto: ruta, p_lat: g?.lat ?? null, p_lon: g?.lon ?? null, p_precision_m: g?.prec ?? null,
+    });
+    return;
+  } catch (err) {
+    if (!(err.status === 404 && err.code === 'PGRST202')) throw err; // PGRST202 = la función aún no existe
+  }
+  const res = await api(`/rest/v1/banderas_azules?id=eq.${r.remotoId}&select=id`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
+    body: JSON.stringify({
+      retirada_at: new Date(r.retiro.ms).toISOString(), retirada_responsable: r.retiro.responsable || 'Sin nombre',
+      ...gpsCampos('retirada', g), foto_retiro: ruta,
+    }),
+  });
+  const j = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(j?.message || `Error ${res.status}`);
+  if (!Array.isArray(j) || !j.length) {
+    throw new Error('Shop Car no registró el retiro: la colocó otro usuario. Pide a tu supervisor que la retire.');
+  }
+}
+
+const esFallaDeRed = err => /Failed to fetch|NetworkError|Load failed/i.test(err.message);
 let enviando = false;
+let ultimoError = null;
 async function sincronizar(manual = false) {
   if (enviando || !sesion || !SHOPCAR.url) return;
   enviando = true;
@@ -232,17 +258,28 @@ async function sincronizar(manual = false) {
     // De la más vieja a la más nueva: el cierre de la anterior tiene que llegar antes que la nueva de esa vía.
     const lista = (await todos()).sort((a, b) => a.colocacion.ms - b.colocacion.ms);
     for (const r of lista) {
-      if (r.usuarioId !== sesion.usuarioId || !pendiente(r)) continue;
-      try { await enviarRegistro(r); } catch (err) { error = err; if (!sesion) break; }
+      if (!pendiente(r)) continue;
+      try {
+        await enviarRegistro(r);
+        if (r.errorEnvio) { delete r.errorEnvio; await guardar(r); }
+      } catch (err) {
+        error = err;
+        if (!sesion) break;
+        if (!esFallaDeRed(err)) { r.errorEnvio = err.message; await guardar(r); }
+      }
     }
   } finally {
     enviando = false;
   }
+  // Sin señal no es un error: se reintenta solo. Cualquier otra cosa se muestra.
+  ultimoError = error && !esFallaDeRed(error) ? error.message : null;
   await pintar();
   if (manual) avisar(error ? `No se pudo enviar todo: ${error.message}` : 'Todo está enviado a Shop Car.', 4000);
 }
 setInterval(sincronizar, 60e3);
 window.addEventListener('online', () => sincronizar());
+// En el celular la app se duerme en segundo plano: al volver a abrirla se reintenta enseguida.
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') sincronizar(); });
 
 function mostrarLogin() {
   const sinSesion = !sesion;
@@ -273,9 +310,9 @@ $('#formLogin').addEventListener('submit', async e => {
   } finally { $('#btnEntrar').disabled = false; }
 });
 $('#btnSalir').addEventListener('click', async () => {
-  const n = (await todos()).filter(r => r.usuarioId === sesion?.usuarioId && pendiente(r)).length;
+  const n = (await todos()).filter(pendiente).length;
   const msj = n
-    ? `Tienes ${n} registro(s) sin enviar a Shop Car. Se enviarán cuando vuelvas a entrar con este usuario. ¿Cerrar sesión?`
+    ? `Tienes ${n} registro(s) sin enviar a Shop Car. Se enviarán cuando alguien vuelva a entrar en este teléfono. ¿Cerrar sesión?`
     : `¿Cerrar la sesión de ${sesion.nombre}?`;
   if (confirm(msj)) cerrarSesion();
 });
@@ -537,6 +574,7 @@ function etiquetaEnvio(r) {
     return `<span class="envio alerta">⚠ En Shop Car ya había otra bandera abierta en esta vía.</span>
       <button class="btn-retirar" data-conflicto="${esc(r.id)}">Indicar motivo y enviar</button>`;
   }
+  if (pendiente(r) && r.errorEnvio) return `<span class="envio alerta">⚠ No se pudo enviar a Shop Car: ${esc(r.errorEnvio)}</span>`;
   return pendiente(r) ? '<span class="envio">⏳ Pendiente de enviar a Shop Car</span>' : '<span class="envio ok">✓ Enviado a Shop Car</span>';
 }
 
@@ -597,11 +635,14 @@ async function pintar() {
   $('#personasUsadas').innerHTML = opciones([sesion?.nombre, ...registros.map(r => r.coloco)]);
 
   if (sesion) {
-    const pendientes = registros.filter(r => r.usuarioId === sesion.usuarioId && pendiente(r)).length;
+    const pendientes = registros.filter(pendiente).length;
     const e = $('#estadoEnvio');
     e.hidden = false;
     e.classList.toggle('ok', !pendientes);
-    e.textContent = pendientes
+    e.classList.toggle('error', !!(pendientes && ultimoError));
+    e.textContent = pendientes && ultimoError
+      ? `⚠ ${pendientes} registro(s) sin enviar: ${ultimoError} · toca para reintentar`
+      : pendientes
       ? `⏳ ${pendientes} registro(s) pendientes de enviar a Shop Car${navigator.onLine ? '' : ' (sin conexión)'} · toca para enviar`
       : `✓ ${sesion.nombre} · todo enviado a Shop Car`;
   }

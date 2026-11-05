@@ -132,3 +132,4 @@ button.estado-envio { display: block; width: 100%; border: 0; font: inherit; fon
   position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: #1d2a44; color: #fff;
   padding: 10px 16px; border-radius: 10px; z-index: 20; max-width: calc(100vw - 32px); font-size: 14px;
 }
+.estado-envio.error { background: #fdecea; color: var(--rojo); font-weight: 600; }

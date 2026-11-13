@@ -253,6 +253,7 @@ let ultimoError = null;
 async function sincronizar(manual = false) {
   if (enviando || !sesion || !SHOPCAR.url) return;
   enviando = true;
+  revisarMudanza(); // muestra "Enviando…" y no deja ver la pantalla de mudanza hasta que termine
   let error = null;
   try {
     // De la más vieja a la más nueva: el cierre de la anterior tiene que llegar antes que la nueva de esa vía.
@@ -647,6 +648,7 @@ async function pintar() {
       : `✓ ${sesion.nombre} · todo enviado a Shop Car`;
   }
   tic();
+  revisarMudanza();
 }
 
 // Cronómetros en vivo
@@ -674,7 +676,63 @@ document.addEventListener('click', async e => {
     }
   }
 });
-$('#btnColocar').addEventListener('click', () => abrirCaptura('colocacion'));
+$('#btnColocar').addEventListener('click', () => {
+  // En la dirección vieja ya no se colocan banderas nuevas: se colocan en la app nueva.
+  // (Las que ya están colocadas en este teléfono se siguen retirando aquí.)
+  if (MUDANZA) {
+    avisar('Esta app se mudó: coloca las banderas nuevas en la app nueva (botón del aviso de arriba).', 6000);
+    return;
+  }
+  abrirCaptura('colocacion');
+});
+
+// ---------- Mudanza ----------
+// Bandera 5.13 se muda de christianmunoz1713.github.io a autocom-shopcar.github.io. Lo que un
+// teléfono tiene sin enviar vive en el almacenamiento de la dirección vieja y se perdería al
+// cambiar de dirección, así que en la dirección vieja esta versión:
+//  * envía todo lo pendiente (colocaciones, retiros, cierres) y espera a que termine;
+//  * mientras haya pendientes, o banderas colocadas en este teléfono (su retiro con foto solo se
+//    puede registrar aquí), sigue funcionando y muestra un aviso que dice qué falta;
+//  * cuando ya no queda nada, muestra la pantalla "La app se mudó" con el botón a la dirección
+//    nueva, y no deja seguir usando esta.
+// En la dirección nueva (u otra) todo esto se apaga y la app funciona normal.
+const DIRECCION_VIEJA = 'christianmunoz1713.github.io';
+const URL_NUEVA = 'https://autocom-shopcar.github.io/bandera-513/';
+const MUDANZA = location.hostname === DIRECCION_VIEJA
+  || (['localhost', '127.0.0.1'].includes(location.hostname) && new URLSearchParams(location.search).has('mudanza'));
+$('#linkMudanza').href = URL_NUEVA;
+
+function revisarMudanza() {
+  if (!MUDANZA) return;
+  // Pendiente = cualquier cosa que no haya llegado a Shop Car, incluidos los registros sin dueño
+  // (hechos antes de iniciar sesión), que solo se envían después de entrar con un usuario.
+  const porEnviar = registros.filter(r => !r.usuarioId || pendiente(r));
+  const colocadas = registros.filter(abierta);
+  const listo = !porEnviar.length && !colocadas.length && !enviando;
+  $('#pantallaMudanza').hidden = !listo;
+  const aviso = $('#avisoMudanza');
+  aviso.hidden = listo;
+  if (listo) return;
+
+  const conError = porEnviar.filter(r => r.errorEnvio);
+  const partes = [];
+  if (enviando) partes.push('⏳ Enviando a Shop Car… no cierres la app.');
+  else if (porEnviar.length) {
+    if (!sesion) partes.push(`⚠ Tienes <b>${porEnviar.length}</b> reporte(s) sin enviar. <b>Entra con tu usuario</b> para enviarlos.`);
+    else if (!navigator.onLine) partes.push(`⚠ Tienes <b>${porEnviar.length}</b> reporte(s) sin enviar y <b>no hay señal</b>. Busca señal y vuelve a abrir la app.`);
+    else partes.push(`⏳ Faltan <b>${porEnviar.length}</b> reporte(s) por enviar a Shop Car.`);
+    if (conError.length) partes.push(`<b>${conError.length}</b> no se pudo(ieron) enviar: ${esc(conError[0].errorEnvio)}. Avísale a tu supervisor y no borres esta app.`);
+  }
+  if (colocadas.length) {
+    partes.push(`⚑ Tienes <b>${colocadas.length}</b> bandera(s) colocada(s) desde este teléfono: <b>retíralas aquí</b> (o ciérralas) como siempre.`);
+  }
+  aviso.className = `aviso-mudanza${conError.length ? ' error' : ''}`;
+  aviso.innerHTML = `<b>Esta app se va a mudar.</b> Las banderas nuevas se colocan en la
+    <a href="${URL_NUEVA}">app nueva</a>. Antes de mudarte:<br>${partes.join('<br>')}
+    ${porEnviar.length && sesion && !enviando ? '<br><button type="button" class="btn-chico" id="btnEnviarMudanza">Enviar ahora</button>' : ''}`;
+  $('#btnEnviarMudanza')?.addEventListener('click', () => sincronizar(true));
+}
+window.addEventListener('offline', revisarMudanza);
 
 // Una colocación hecha sin señal chocó en Shop Car con otra abierta en la misma vía.
 async function resolverConflicto(r) {

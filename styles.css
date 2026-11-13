@@ -133,3 +133,19 @@ button.estado-envio { display: block; width: 100%; border: 0; font: inherit; fon
   padding: 10px 16px; border-radius: 10px; z-index: 20; max-width: calc(100vw - 32px); font-size: 14px;
 }
 .estado-envio.error { background: #fdecea; color: var(--rojo); font-weight: 600; }
+
+/* ---------- Mudanza a autocom-shopcar.github.io ---------- */
+.aviso-mudanza {
+  margin: 12px 16px 0; padding: 12px 14px; border-radius: 12px; line-height: 1.4;
+  background: #fff7e6; border: 1px solid #f0c36d; color: #5c3b00;
+}
+.aviso-mudanza.error { background: #fdecec; border-color: #ef9a9a; color: #7f1d1d; }
+.aviso-mudanza button { margin-top: 8px; }
+.pantalla-mudanza {
+  position: fixed; inset: 0; z-index: 100; background: var(--fondo); overflow: auto;
+  display: flex; align-items: center; justify-content: center; padding: 20px;
+}
+.pantalla-mudanza .tarjeta { max-width: 460px; width: 100%; }
+.pantalla-mudanza h2 { margin-top: 0; color: var(--azul); }
+.btn-link { display: block; text-align: center; text-decoration: none; margin: 16px 0; }
+.pasos-mudanza { padding-left: 20px; line-height: 1.6; }

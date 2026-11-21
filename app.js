@@ -96,6 +96,10 @@ async function pedirToken(tipo, cuerpo) {
 async function iniciarSesion(usuario, password) {
   const email = usuario.includes('@') ? usuario.trim() : `${usuario.trim().toLowerCase()}@shopcar.local`;
   guardarSesion(await pedirToken('password', { email, password }), usuario.trim());
+  await completarSesion();
+}
+// Nombre de Shop Car y registros sin dueño; común a iniciar sesión y al traspaso de sesión.
+async function completarSesion() {
   const r = await api(`/rest/v1/usuario_perfil?select=nombre_completo&usuario_id=eq.${sesion.usuarioId}`);
   const perfil = r.ok ? (await r.json())[0] : null;
   sesion.nombre = perfil?.nombre_completo || sesion.usuario;
@@ -247,6 +251,53 @@ async function enviarRetiro(r, ruta) {
   }
 }
 
+// ---------- Banderas abiertas en Shop Car ----------
+// La app solo guarda las banderas que se colocaron desde este teléfono. Si se colocaron desde otro
+// teléfono, desde la dirección vieja de la app o antes de reinstalarla, no aparecían y no había
+// forma de retirarlas. Ahora se descargan las abiertas de Shop Car y se pueden retirar con foto.
+const ABIERTAS_KEY = 'bandera513-abiertas';
+let remotas = (() => { try { return JSON.parse(localStorage.getItem(ABIERTAS_KEY)) || []; } catch { return []; } })();
+
+async function cargarAbiertas() {
+  if (!sesion || !navigator.onLine) return;
+  let lista, completa = true;
+  try {
+    lista = await rpc('banderas_abiertas', {});
+  } catch (err) {
+    if (!(err.status === 404 && err.code === 'PGRST202')) return; // sin señal u otro error: se queda la copia
+    // Shop Car aún sin banderas_abiertas: con las reglas de la tabla, cada quien ve las suyas
+    // (un supervisor, todas). Sirve para las propias colocadas desde otro teléfono.
+    const r = await api('/rest/v1/banderas_azules?select=id,folio,localidad,localidad_id,via,equipo,via_equipo,responsable,observaciones,colocada_at&retirada_at=is.null&cerrada_at=is.null&order=colocada_at');
+    if (!r.ok) return;
+    lista = await r.json();
+    completa = false;
+  }
+  remotas = lista;
+  localStorage.setItem(ABIERTAS_KEY, JSON.stringify(lista));
+  if (!completa) return;
+  // Las que en este teléfono siguen colocadas pero en Shop Car ya no (las retiró o cerró alguien
+  // más): se dan por cerradas aquí, para que no estorben ni bloqueen la vía.
+  const abiertasEnShopCar = new Set(lista.map(b => b.id));
+  for (const r of await todos()) {
+    if (!abierta(r) || pendiente(r) || !r.enviado?.colocacion || abiertasEnShopCar.has(r.remotoId)) continue;
+    r.cierre = { ms: Date.now(), motivo: 'Ya estaba retirada o cerrada en Shop Car', responsable: '' };
+    r.enviado = { ...r.enviado, cierre: true };
+    r.cerradaFuera = true;
+    await guardar(r);
+  }
+}
+// Una bandera de Shop Car que se va a retirar desde este teléfono: se guarda como registro local
+// (sin foto de colocación) para que el retiro use la misma cola de envío.
+function registroDeRemota(b) {
+  return {
+    id: `R-${b.id}`, folio: b.folio, localidad: b.localidad, localidadId: b.localidad_id,
+    via: b.via ?? b.via_equipo ?? '', equipo: b.equipo || '', coloco: b.responsable, obs: b.observaciones || '',
+    colocacion: { ms: new Date(b.colocada_at).getTime(), foto: null, gps: null, responsable: null },
+    retiro: null, cierre: null, remota: true,
+    remotoId: b.id, usuarioId: sesion.usuarioId, enviado: { colocacion: true, retiro: false, cierre: false },
+  };
+}
+
 const esFallaDeRed = err => /Failed to fetch|NetworkError|Load failed/i.test(err.message);
 let enviando = false;
 let ultimoError = null;
@@ -272,6 +323,7 @@ async function sincronizar(manual = false) {
   } finally {
     enviando = false;
   }
+  try { await cargarAbiertas(); } catch { /* se queda la copia anterior */ }
   // Sin señal no es un error: se reintenta solo. Cualquier otra cosa se muestra.
   ultimoError = error && !esFallaDeRed(error) ? error.message : null;
   await pintar();
@@ -564,6 +616,7 @@ $('#btnCancelar').addEventListener('click', () => { captura = null; $('#dlgCaptu
 let registros = [];
 const urls = new Map(); // id+tipo -> objectURL de la foto
 function urlFoto(r, tipo) {
+  if (!r[tipo]?.foto) return '';
   const k = r.id + tipo;
   if (!urls.has(k)) urls.set(k, URL.createObjectURL(r[tipo].foto));
   return urls.get(k);
@@ -585,8 +638,19 @@ function tarjetaActiva(r) {
     <div class="cronometro" data-desde="${r.colocacion.ms}">${duracion(Date.now() - r.colocacion.ms)}</div>
     <div class="meta">Colocada ${fechaHora(r.colocacion.ms)} · Colocó: ${esc(colocoDe(r))}
       ${r.obs ? `<br>${esc(r.obs)}` : ''}<br>${etiquetaEnvio(r)}</div>
-    <div class="fotos"><figure><img src="${urlFoto(r, 'colocacion')}" data-foto="${esc(r.id)}|colocacion" alt="Foto de colocación"><figcaption>Colocación</figcaption></figure></div>
+    ${r.colocacion.foto ? `<div class="fotos"><figure><img src="${urlFoto(r, 'colocacion')}" data-foto="${esc(r.id)}|colocacion" alt="Foto de colocación"><figcaption>Colocación</figcaption></figure></div>` : ''}
     <button class="btn-retirar" data-retirar="${esc(r.id)}">Retirar bandera</button>
+  </div>`;
+}
+function tarjetaRemota(b) {
+  const ms = new Date(b.colocada_at).getTime();
+  return `<div class="tarjeta bandera remota">
+    <div class="cab"><h3>${esc([b.localidad, b.via ?? b.via_equipo, b.equipo].filter(Boolean).join(' · '))}</h3><span class="folio">${esc(b.folio)}</span></div>
+    <div class="cronometro" data-desde="${ms}">${duracion(Date.now() - ms)}</div>
+    <div class="meta">Colocada ${fechaHora(ms)} · Colocó: ${esc(b.responsable)}
+      ${b.observaciones ? `<br>${esc(b.observaciones)}` : ''}<br>
+      <span class="envio">📡 Colocada desde otro teléfono o desde la app anterior</span></div>
+    <button class="btn-retirar" data-retirar-remota="${esc(b.id)}">Retirar bandera</button>
   </div>`;
 }
 function tarjetaHistorial(r) {
@@ -602,7 +666,7 @@ function tarjetaHistorial(r) {
       ${r.obs ? `<br>${esc(r.obs)}` : ''}<br>${etiquetaEnvio(r)}
     </div>
     <div class="fotos">
-      <figure><img src="${urlFoto(r, 'colocacion')}" data-foto="${esc(r.id)}|colocacion" alt="Foto de colocación"><figcaption>Colocación</figcaption></figure>
+      ${r.colocacion.foto ? `<figure><img src="${urlFoto(r, 'colocacion')}" data-foto="${esc(r.id)}|colocacion" alt="Foto de colocación"><figcaption>Colocación</figcaption></figure>` : ''}
       ${r.retiro ? `<figure><img src="${urlFoto(r, 'retiro')}" data-foto="${esc(r.id)}|retiro" alt="Foto de retiro"><figcaption>Retiro</figcaption></figure>` : ''}
     </div>
     ${pendiente(r) ? '' : `<button class="borrar" data-borrar="${esc(r.id)}">Quitar de este teléfono</button>`}
@@ -619,8 +683,13 @@ function filtrados() {
 async function pintar() {
   registros = await todos();
   const activas = registros.filter(abierta).sort((a, b) => a.colocacion.ms - b.colocacion.ms);
-  $('#numActivas').textContent = activas.length;
-  $('#listaActivas').innerHTML = activas.length ? activas.map(tarjetaActiva).join('')
+  // Las abiertas en Shop Car que este teléfono no tiene (o que ya retiró y falta enviar).
+  const enTelefono = new Set(registros.map(r => r.remotoId));
+  const deShopCar = sesion && !MUDANZA ? remotas.filter(b => !enTelefono.has(b.id)) : [];
+  $('#numActivas').textContent = activas.length + deShopCar.length;
+  $('#listaActivas').innerHTML = activas.length || deShopCar.length
+    ? activas.map(tarjetaActiva).join('') +
+      (deShopCar.length ? `<h2 class="subtitulo">Colocadas desde otro teléfono (${deShopCar.length})</h2>` + deShopCar.map(tarjetaRemota).join('') : '')
     : '<p class="vacio">No hay banderas colocadas en este momento.</p>';
 
   const hist = filtrados();
@@ -664,6 +733,10 @@ setInterval(tic, 1000);
 document.addEventListener('click', async e => {
   const t = e.target;
   if (t.dataset.retirar) abrirCaptura('retiro', registros.find(r => r.id === t.dataset.retirar));
+  else if (t.dataset.retirarRemota) {
+    const b = remotas.find(x => x.id === t.dataset.retirarRemota);
+    if (b && sesion) abrirCaptura('retiro', registroDeRemota(b));
+  }
   else if (t.dataset.foto) verFoto(...t.dataset.foto.split('|'));
   else if (t.dataset.conflicto) resolverConflicto(registros.find(r => r.id === t.dataset.conflicto));
   else if (t.dataset.borrar) {
@@ -702,6 +775,21 @@ const MUDANZA = location.hostname === DIRECCION_VIEJA
   || (['localhost', '127.0.0.1'].includes(location.hostname) && new URLSearchParams(location.search).has('mudanza'));
 $('#linkMudanza').href = URL_NUEVA;
 
+// Al pasar a la app nueva se lleva la sesión para no pedir otra vez usuario y contraseña (el
+// personal de campo no siempre la recuerda). Va en el fragmento (#), que no sale del teléfono; la
+// app nueva lo cambia por una sesión propia en cuanto abre, y la de aquí se cierra.
+function irAppNueva() {
+  let url = URL_NUEVA;
+  if (sesion?.refresh) {
+    url += `#traspaso=${encodeURIComponent(sesion.refresh)}&u=${encodeURIComponent(sesion.usuario || '')}`;
+    sesion = null;
+    localStorage.removeItem(SESION_KEY);
+  }
+  location.href = url;
+}
+$('#linkMudanza').addEventListener('click', e => { e.preventDefault(); irAppNueva(); });
+let saltoMudanza = null;
+
 function revisarMudanza() {
   if (!MUDANZA) return;
   // Pendiente = cualquier cosa que no haya llegado a Shop Car, incluidos los registros sin dueño
@@ -712,6 +800,8 @@ function revisarMudanza() {
   $('#pantallaMudanza').hidden = !listo;
   const aviso = $('#avisoMudanza');
   aviso.hidden = listo;
+  // Ya no queda nada aquí: pasa sola a la app nueva (el botón sigue por si no lo hace).
+  if (listo && !saltoMudanza) saltoMudanza = setTimeout(irAppNueva, 2500);
   if (listo) return;
 
   const conError = porEnviar.filter(r => r.errorEnvio);
@@ -728,7 +818,7 @@ function revisarMudanza() {
   }
   aviso.className = `aviso-mudanza${conError.length ? ' error' : ''}`;
   aviso.innerHTML = `<b>Esta app se va a mudar.</b> Las banderas nuevas se colocan en la
-    <a href="${URL_NUEVA}">app nueva</a>. Antes de mudarte:<br>${partes.join('<br>')}
+    <a href="${URL_NUEVA}" id="linkMudanzaAviso">app nueva</a>. Antes de mudarte:<br>${partes.join('<br>')}
     ${porEnviar.length && sesion && !enviando ? '<br><button type="button" class="btn-chico" id="btnEnviarMudanza">Enviar ahora</button>' : ''}`;
   $('#btnEnviarMudanza')?.addEventListener('click', () => sincronizar(true));
 }
@@ -809,11 +899,30 @@ $('#btnInstalar').addEventListener('click', async () => {
 });
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
 
+// Sesión que trae la app de la dirección vieja (ver irAppNueva).
+async function recibirTraspaso() {
+  const datos = new URLSearchParams(location.hash.slice(1));
+  const refresh = datos.get('traspaso');
+  if (!refresh) return;
+  history.replaceState(null, '', location.pathname + location.search); // que no se quede en el historial
+  if (sesion) return;
+  try {
+    guardarSesion(await pedirToken('refresh_token', { refresh_token: refresh }), datos.get('u') || '');
+    await completarSesion();
+    avisar(`Bienvenido, ${sesion.nombre}. Ya estás en la app nueva.`, 4500);
+  } catch {
+    sesion = null;
+    localStorage.removeItem(SESION_KEY);
+    avisar('Entra con tu usuario y contraseña de Shop Car.', 4500);
+  }
+}
+
 // ---------- Inicio ----------
 (async () => {
   await abrirDB();
   navigator.storage?.persist?.();
   localStorage.removeItem('bandera513-ajustes'); // la pantalla de Ajustes ya no existe
+  await recibirTraspaso();
   mostrarLogin();
   await cargarLocalidades();
   await pintar();

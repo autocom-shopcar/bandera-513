@@ -149,3 +149,5 @@ button.estado-envio { display: block; width: 100%; border: 0; font: inherit; fon
 .pantalla-mudanza h2 { margin-top: 0; color: var(--azul); }
 .btn-link { display: block; text-align: center; text-decoration: none; margin: 16px 0; }
 .pasos-mudanza { padding-left: 20px; line-height: 1.6; }
+.subtitulo { font-size: 15px; color: var(--tenue); margin: 18px 0 8px; }
+.bandera.remota { border-left-color: #8a96ad; background: #f7f9fc; }

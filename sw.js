@@ -1,7 +1,7 @@
 // Service worker: permite instalar la app y usarla sin internet.
 // v8: versión de mudanza (ver app.js "Mudanza"). Subir la versión hace que todos los
 // teléfonos tomen esta versión la próxima vez que abran la app con señal.
-const CACHE = 'bandera-513-v8';
+const CACHE = 'bandera-513-v9';
 const ARCHIVOS = ['./', 'index.html', 'styles.css', 'app.js', 'config.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png'];
 

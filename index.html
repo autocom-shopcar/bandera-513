@@ -94,13 +94,13 @@
         <label>Localidad donde se coloca la bandera
           <select id="cLocalidad" required><option value="">Elige la localidad…</option></select>
         </label>
-        <label>Vía
-          <input id="cVia" required placeholder="Ej. Vía 3" list="viasUsadas" autocomplete="off">
+        <div class="campo-vias">
+          <span class="etiqueta">Vías y equipo protegido</span>
+          <div id="cVias"></div>
           <datalist id="viasUsadas"></datalist>
-        </label>
-        <label>Equipo protegido
-          <input id="cEquipo" placeholder="Opcional. Ej. carro GMX 12345" autocomplete="off">
-        </label>
+          <button type="button" id="btnAgregarVia" class="btn-sec">+ Agregar otra vía</button>
+          <p id="notaVias" class="nota" hidden>Para cambiar las vías, quita las fotos.</p>
+        </div>
         <label>¿Quién colocó la bandera?
           <input id="cColoco" required placeholder="Nombre de quien la colocó" list="personasUsadas" autocomplete="off">
           <datalist id="personasUsadas"></datalist>
@@ -124,8 +124,8 @@
         <span>📷 Tomar foto</span>
         <input type="file" id="cFoto" accept="image/*" capture="environment" hidden>
       </label>
+      <div id="capFotos" class="cap-fotos"></div>
       <p id="capEstado" class="nota"></p>
-      <img id="capVista" alt="Vista previa con marca de agua" hidden>
 
       <div class="acciones-fila fin">
         <button type="button" id="btnCancelar" class="btn-sec">Cancelar</button>

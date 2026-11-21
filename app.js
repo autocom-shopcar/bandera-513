@@ -49,6 +49,8 @@ function duracion(ms) {
 // Los registros anteriores guardaban vía y equipo juntos en `ubicacion` y no tenían "colocó".
 const viaDe = r => r.via ?? r.ubicacion ?? '';
 const colocoDe = r => r.coloco || r.colocacion.responsable || 'Sin nombre';
+// Fotos de la colocación o del retiro (los registros viejos solo tienen una).
+const fotosLocal = (r, tipo) => r[tipo]?.fotos ?? (r[tipo]?.foto ? [r[tipo].foto] : []);
 const lugar = r => [r.localidad, viaDe(r), r.equipo].filter(Boolean).join(' · ');
 const abierta = r => !r.retiro && !r.cierre;
 const finDe = r => r.retiro?.ms ?? r.cierre?.ms;
@@ -170,21 +172,33 @@ const pendiente = r => r.usuarioId && (!r.enviado?.colocacion || (r.retiro && !r
 
 async function enviarRegistro(r) {
   if (!r.enviado.colocacion) {
-    // La foto va en la carpeta de quien la envía (así lo pide Shop Car).
-    const ruta = `${sesion.usuarioId}/${r.remotoId}_colocacion.jpg`;
-    await subirFoto(ruta, r.colocacion.foto);
+    // Las fotos van en la carpeta de quien las envía (así lo pide Shop Car). Las de un reporte de
+    // varias vías se suben una vez (mismo nombre) y todas sus banderas las comparten.
+    const fotos = fotosLocal(r, 'colocacion');
+    const rutas = r.reporteId
+      ? fotos.map((_, i) => `${sesion.usuarioId}/${r.reporteId}_colocacion_${i + 1}.jpg`)
+      : [`${sesion.usuarioId}/${r.remotoId}_colocacion.jpg`];
+    for (const [i, ruta] of rutas.entries()) await subirFoto(ruta, fotos[i]);
+    const ruta = rutas[0];
     const viejo = !('via' in r);
-    const res = await api('/rest/v1/banderas_azules', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-      body: JSON.stringify({
-        id: r.remotoId, folio: r.folio, responsable: colocoDe(r), ficha: r.colocacion.ficha || null,
-        empresa: r.empresa || null, localidad: r.localidad || r.ubicacion, localidad_id: r.localidadId ?? null,
-        via: viejo ? null : r.via, equipo: viejo ? null : (r.equipo || null),
-        via_equipo: viejo ? ((r.localidad && r.ubicacion) || null) : null,
-        observaciones: r.obs || null, colocada_at: new Date(r.colocacion.ms).toISOString(),
-        ...gpsCampos('colocada', r.colocacion.gps), foto_colocacion: ruta,
-      }),
+    const fila = {
+      id: r.remotoId, folio: r.folio, responsable: colocoDe(r), ficha: r.colocacion.ficha || null,
+      empresa: r.empresa || null, localidad: r.localidad || r.ubicacion, localidad_id: r.localidadId ?? null,
+      via: viejo ? null : r.via, equipo: viejo ? null : (r.equipo || null),
+      via_equipo: viejo ? ((r.localidad && r.ubicacion) || null) : null,
+      observaciones: r.obs || null, colocada_at: new Date(r.colocacion.ms).toISOString(),
+      ...gpsCampos('colocada', r.colocacion.gps), foto_colocacion: ruta,
+      ...(r.reporteId ? { reporte_id: r.reporteId, fotos_colocacion: rutas } : {}),
+    };
+    const insertar = cuerpo => api('/rest/v1/banderas_azules', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(cuerpo),
     });
+    let res = await insertar(fila);
+    if (!res.ok && res.status === 400 && /fotos_colocacion|reporte_id/.test(await res.clone().text())) {
+      // Shop Car todavía sin varias fotos (migración 244): va solo la primera.
+      const { reporte_id, fotos_colocacion, ...sinFotos } = fila;
+      res = await insertar(sinFotos);
+    }
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
       if (/banderas_una_abierta_por_via/.test(j.message || '')) {
@@ -201,10 +215,14 @@ async function enviarRegistro(r) {
     await guardar(r);
   }
   if (r.retiro && !r.enviado.retiro) {
-    const ruta = `${sesion.usuarioId}/${r.remotoId}_retiro.jpg`;
-    await subirFoto(ruta, r.retiro.foto);
+    const fotos = fotosLocal(r, 'retiro');
+    const prefijo = r.retiro.grupoId ?? r.remotoId; // un retiro de varias banderas sube las fotos una vez
+    const rutas = r.retiro.fotos
+      ? fotos.map((_, i) => `${sesion.usuarioId}/${prefijo}_retiro_${i + 1}.jpg`)
+      : [`${sesion.usuarioId}/${r.remotoId}_retiro.jpg`];
+    for (const [i, ruta] of rutas.entries()) await subirFoto(ruta, fotos[i]);
     try {
-      await enviarRetiro(r, ruta);
+      await enviarRetiro(r, rutas);
     } catch (err) {
       // Ya estaba retirada o cerrada sin retiro (otro intento sí llegó, o la cerró alguien más).
       if (!/ya se registró como retirada|ya se cerró sin retiro/.test(err.message)) throw err;
@@ -226,16 +244,24 @@ async function enviarRegistro(r) {
 // El retiro se registra con retirar_bandera (cualquier usuario con rol puede retirar). Si Shop Car
 // aún no tiene esa función, se usa la actualización directa, pero confirmando que sí cambió la
 // bandera: antes, si la base no la encontraba o no dejaba, la app lo daba por enviado.
-async function enviarRetiro(r, ruta) {
-  const g = r.retiro.gps;
+async function enviarRetiro(r, rutas) {
+  const g = r.retiro.gps, ruta = rutas[0];
+  const args = {
+    p_id: r.remotoId, p_retirada_at: new Date(r.retiro.ms).toISOString(), p_responsable: r.retiro.responsable || 'Sin nombre',
+    p_foto: ruta, p_lat: g?.lat ?? null, p_lon: g?.lon ?? null, p_precision_m: g?.prec ?? null,
+  };
+  const noExiste = err => err.status === 404 && err.code === 'PGRST202'; // la función (o esa versión) aún no existe
   try {
-    await rpc('retirar_bandera', {
-      p_id: r.remotoId, p_retirada_at: new Date(r.retiro.ms).toISOString(), p_responsable: r.retiro.responsable || 'Sin nombre',
-      p_foto: ruta, p_lat: g?.lat ?? null, p_lon: g?.lon ?? null, p_precision_m: g?.prec ?? null,
-    });
+    await rpc('retirar_bandera', { ...args, p_fotos: rutas });
     return;
   } catch (err) {
-    if (!(err.status === 404 && err.code === 'PGRST202')) throw err; // PGRST202 = la función aún no existe
+    if (!noExiste(err)) throw err;
+  }
+  try {
+    await rpc('retirar_bandera', args); // Shop Car sin varias fotos (migración 244): va solo la primera
+    return;
+  } catch (err) {
+    if (!noExiste(err)) throw err;
   }
   const res = await api(`/rest/v1/banderas_azules?id=eq.${r.remotoId}&select=id`, {
     method: 'PATCH', headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
@@ -292,7 +318,7 @@ function registroDeRemota(b) {
   return {
     id: `R-${b.id}`, folio: b.folio, localidad: b.localidad, localidadId: b.localidad_id,
     via: b.via ?? b.via_equipo ?? '', equipo: b.equipo || '', coloco: b.responsable, obs: b.observaciones || '',
-    colocacion: { ms: new Date(b.colocada_at).getTime(), foto: null, gps: null, responsable: null },
+    colocacion: { ms: new Date(b.colocada_at).getTime(), foto: null, fotos: [], gps: null, responsable: null },
     retiro: null, cierre: null, remota: true,
     remotoId: b.id, usuarioId: sesion.usuarioId, enviado: { colocacion: true, retiro: false, cierre: false },
   };
@@ -372,6 +398,23 @@ $('#btnSalir').addEventListener('click', async () => {
 $('#estadoEnvio').addEventListener('click', () => sincronizar(true));
 
 // ---------- Marca de agua ----------
+// "Vía: 3 · GMX 1" o, con varias, "Vías: 3 (GMX 1), 4, 5" partido en renglones si es largo.
+function textoVias(vias) {
+  const partes = vias.filter(v => v.via).map(v => v.equipo ? `${v.via} (${v.equipo})` : v.via);
+  if (!partes.length) return [];
+  if (partes.length === 1) return [`Vía: ${partes[0]}`];
+  const renglones = [];
+  let actual = 'Vías: ';
+  for (const p of partes) {
+    const pedazo = actual === 'Vías: ' || actual === '      ' ? p : `, ${p}`;
+    if ((actual + pedazo).length > 46 && actual.trim() !== 'Vías:') { renglones.push(actual + ','); actual = '      ' + p; }
+    else actual += pedazo;
+  }
+  renglones.push(actual);
+  return renglones;
+}
+// "B513-20261121-0005" o "B513-20261121-0005 a 0007".
+const textoFolios = f => f.length > 1 ? `${f[0]} a ${f[f.length - 1].split('-').pop()}` : f[0];
 async function fotoConMarca(archivo, info) {
   const bmp = await createImageBitmap(archivo); // Chrome respeta la orientación EXIF
   const k = Math.min(1, MAX_LADO / Math.max(bmp.width, bmp.height));
@@ -389,7 +432,7 @@ async function fotoConMarca(archivo, info) {
   c.font = `700 ${base * 1.6}px system-ui, sans-serif`;
   c.fillStyle = 'rgba(255,255,255,0.13)';
   c.textAlign = 'center';
-  const texto = `REGLA 5.13 · ${info.folio}`;
+  const texto = `REGLA 5.13 · ${info.folios[0]}`;
   const paso = base * 6, ancho = c.measureText(texto).width + base * 4, diag = Math.hypot(W, H);
   for (let fila = 0, y = -diag / 2; y < diag / 2; fila++, y += paso)
     for (let x = -diag / 2; x < diag / 2 + ancho; x += ancho)
@@ -401,8 +444,7 @@ async function fotoConMarca(archivo, info) {
     [`${info.tipo === 'colocacion' ? 'COLOCACIÓN' : 'RETIRO'} DE BANDERA · REGLA 5.13`, true],
     [`Fecha y hora: ${fechaHora(info.ms)}`],
     [`Localidad: ${info.localidad}`],
-    ...(info.via ? [[`Vía: ${info.via}`]] : []),
-    ...(info.equipo ? [[`Equipo: ${info.equipo}`]] : []),
+    ...textoVias(info.vias).map(t => [t]),
     [`Colocó: ${info.coloco}`],
   ];
   if (info.tipo === 'retiro') {
@@ -412,7 +454,7 @@ async function fotoConMarca(archivo, info) {
     lineas.push([`Reportó: ${info.reporta}`]);
   }
   lineas.push([info.gps ? `GPS: ${info.gps.lat.toFixed(6)}, ${info.gps.lon.toFixed(6)} ±${info.gps.prec} m` : 'GPS: no disponible']);
-  lineas.push([`Folio: ${info.folio}`]);
+  lineas.push([`${info.folios.length > 1 ? 'Folios' : 'Folio'}: ${textoFolios(info.folios)} · Foto ${info.numero}`]);
 
   const alto = base * 1.45, pad = base * 0.8;
   const franja = lineas.length * alto + pad * 1.6;
@@ -431,23 +473,36 @@ async function fotoConMarca(archivo, info) {
 }
 
 // ---------- Una bandera abierta por vía ----------
-// Revisa las banderas abiertas de este teléfono y, si hay señal, las de Shop Car (de cualquier persona).
+// Revisa, para cada vía del reporte, las banderas abiertas de este teléfono y, si hay señal, las de
+// Shop Car (de cualquier persona). Basta una ocupada para no dejar colocar.
 let revisionVia = { clave: '', estado: 'pendiente', locales: [], remotas: [] };
 
+// Vías del formulario: [{ via, equipo }], sin las filas vacías.
+function viasCapturadas() {
+  return [...document.querySelectorAll('#cVias .fila-via')]
+    .map(f => ({ via: f.querySelector('.c-via').value.trim(), equipo: f.querySelector('.c-equipo').value.trim() }))
+    .filter(v => v.via);
+}
+const claveRevision = () => `${clave($('#cLocalidad').value)}|${viasCapturadas().map(v => clave(v.via)).join('|')}`;
+
 async function revisarVia() {
-  const loc = $('#cLocalidad').value.trim(), via = $('#cVia').value.trim();
-  const k = `${clave(loc)}|${clave(via)}`;
-  if (!loc || !via) { revisionVia = { clave: '', estado: 'pendiente', locales: [], remotas: [] }; pintarBloqueo(); return revisionVia; }
+  const loc = $('#cLocalidad').value.trim(), vias = viasCapturadas();
+  const k = claveRevision();
+  if (!loc || !vias.length) { revisionVia = { clave: '', estado: 'pendiente', locales: [], remotas: [] }; pintarBloqueo(); return revisionVia; }
   revisionVia = { clave: k, estado: 'verificando', locales: [], remotas: [] };
   const registrosLocales = await todos();
-  const locales = registrosLocales.filter(r => abierta(r) && clave(r.localidad) === clave(loc) && clave(viaDe(r)) === clave(via));
+  const claves = new Set(vias.map(v => clave(v.via)));
+  const locales = registrosLocales.filter(r => abierta(r) && clave(r.localidad) === clave(loc) && claves.has(clave(viaDe(r))));
   let remotas = [];
   if (navigator.onLine && sesion) {
-    try {
-      // Las de este teléfono se juzgan por lo que hay aquí (un cierre puede no haber llegado aún).
-      const propias = new Set(registrosLocales.map(r => r.remotoId));
-      remotas = (await rpc('banderas_abiertas_en_via', { p_localidad: loc, p_via: via })).filter(b => !propias.has(b.id));
-    } catch { /* sin señal: solo cuenta lo de este teléfono; Shop Car lo vuelve a revisar al enviar */ }
+    // Las de este teléfono se juzgan por lo que hay aquí (un cierre puede no haber llegado aún).
+    const propias = new Set(registrosLocales.map(r => r.remotoId));
+    for (const v of vias) {
+      try {
+        const lista = await rpc('banderas_abiertas_en_via', { p_localidad: loc, p_via: v.via });
+        remotas.push(...lista.filter(b => !propias.has(b.id)).map(b => ({ ...b, via: v.via })));
+      } catch { /* sin señal: solo cuenta lo de este teléfono; Shop Car lo vuelve a revisar al enviar */ }
+    }
   }
   if (revisionVia.clave !== k) return revisionVia; // cambiaron los campos mientras se revisaba
   revisionVia = { clave: k, estado: locales.length || remotas.length ? 'bloqueada' : 'libre', locales, remotas };
@@ -459,18 +514,53 @@ function pintarBloqueo() {
   $('#capBloqueo').hidden = !bloqueada;
   if (!bloqueada) return;
   const lista = [
-    ...b.locales.map(r => `${r.folio}, colocada ${fechaHora(r.colocacion.ms)} por ${colocoDe(r)}`),
-    ...b.remotas.map(r => `${r.folio}, colocada ${fechaHora(new Date(r.colocada_at).getTime())} por ${r.responsable}`),
+    ...b.locales.map(r => `Vía ${viaDe(r)}: ${r.folio}, colocada ${fechaHora(r.colocacion.ms)} por ${colocoDe(r)}`),
+    ...b.remotas.map(r => `Vía ${r.via}: ${r.folio}, colocada ${fechaHora(new Date(r.colocada_at).getTime())} por ${r.responsable}`),
   ];
-  $('#bloqueoTexto').innerHTML = `⚠ <b>Ya hay una bandera abierta en esta vía.</b> No se puede colocar otra hasta que se retire o se indique por qué no se retiró:<br>${lista.map(esc).join('<br>')}`;
+  const varias = lista.length > 1;
+  $('#bloqueoTexto').innerHTML = `⚠ <b>Ya hay ${varias ? 'banderas abiertas' : 'una bandera abierta'} en ${varias ? 'estas vías' : 'esta vía'}.</b>
+    No se puede colocar otra hasta que se retire o se indique por qué no se retiró:<br>${lista.map(esc).join('<br>')}`;
   $('#bloqueoRetirar').innerHTML = b.locales.map(r =>
     `<button type="button" class="btn-retirar" data-retirar="${esc(r.id)}">Retirar ${esc(r.folio)}</button>`).join('');
 }
 let revisionTimer;
-['#cLocalidad', '#cVia'].forEach(s => $(s).addEventListener('input', () => {
+function programarRevision() {
   revisionVia = { clave: '', estado: 'pendiente', locales: [], remotas: [] };
   clearTimeout(revisionTimer); revisionTimer = setTimeout(revisarVia, 500);
-}));
+}
+$('#cLocalidad').addEventListener('input', programarRevision);
+$('#cVias').addEventListener('input', e => { if (e.target.classList.contains('c-via')) programarRevision(); });
+
+// Filas de vías: una al abrir; "+ Agregar otra vía" agrega más (hasta 10).
+const MAX_VIAS = 10;
+function agregarFilaVia(via = '', equipo = '') {
+  const filas = $('#cVias');
+  if (filas.children.length >= MAX_VIAS) { avisar(`Máximo ${MAX_VIAS} vías por reporte.`); return; }
+  const f = document.createElement('div');
+  f.className = 'fila-via';
+  f.innerHTML = `<input class="c-via" placeholder="Vía. Ej. Vía 3" list="viasUsadas" autocomplete="off" value="${esc(via)}">
+    <input class="c-equipo" placeholder="Equipo (opcional)" autocomplete="off" value="${esc(equipo)}">
+    <button type="button" class="quitar-via" title="Quitar esta vía" aria-label="Quitar esta vía">✕</button>`;
+  filas.appendChild(f);
+  pintarFilasVia();
+}
+function pintarFilasVia() {
+  const filas = [...document.querySelectorAll('#cVias .fila-via')];
+  const bloqueadas = !!captura?.fotos?.length; // con fotos tomadas las vías ya no cambian (van en la marca de agua)
+  filas.forEach(f => {
+    f.querySelectorAll('input').forEach(i => { i.disabled = bloqueadas; });
+    f.querySelector('.quitar-via').hidden = bloqueadas || filas.length === 1;
+  });
+  $('#btnAgregarVia').hidden = bloqueadas || filas.length >= MAX_VIAS;
+  $('#notaVias').hidden = !bloqueadas;
+}
+$('#cVias').addEventListener('click', e => {
+  if (!e.target.classList.contains('quitar-via')) return;
+  e.target.closest('.fila-via').remove();
+  pintarFilasVia();
+  programarRevision();
+});
+$('#btnAgregarVia').addEventListener('click', () => { agregarFilaVia(); $('#cVias .fila-via:last-child .c-via').focus(); });
 
 $('#btnCerrarSinRetiro').addEventListener('click', async () => {
   const motivo = $('#bMotivo').value.trim();
@@ -491,20 +581,23 @@ $('#btnCerrarSinRetiro').addEventListener('click', async () => {
     await revisarVia();
     await pintar();
     sincronizar();
-    avisar('Bandera anterior cerrada sin retiro. Ya puedes tomar la foto de la nueva.', 4500);
+    avisar('Bandera(s) anterior(es) cerrada(s) sin retiro. Ya puedes tomar las fotos.', 4500);
   } catch (err) {
     avisar('No se pudo cerrar: ' + err.message, 5000);
   } finally { btn.disabled = false; }
 });
 
 // ---------- Captura (colocar / retirar) ----------
-let captura = null; // { tipo, registro?, blob, ms, gps, folio }
+// Una colocación puede llevar varias vías (una bandera por vía, con las mismas fotos) y de 1 a 6
+// fotos. Un retiro puede ser de una bandera o de todas las de un reporte, también con varias fotos.
+const MAX_FOTOS = 6;
+let captura = null; // { tipo, registros (retiro), fotos: [{ blob, ms, gps }], folios }
 
-function abrirCaptura(tipo, registro) {
+function abrirCaptura(tipo, registros) {
   if ($('#dlgCaptura').open) $('#dlgCaptura').close();
-  captura = { tipo, registro };
+  registros = [].concat(registros || []);
+  captura = { tipo, registros, fotos: [], folios: null };
   $('#formCaptura').reset();
-  $('#capVista').hidden = true; $('#capVista').src = '';
   $('#btnGuardar').disabled = true;
   $('#capEstado').textContent = '';
   $('#capBloqueo').hidden = true;
@@ -512,35 +605,67 @@ function abrirCaptura(tipo, registro) {
   if (tipo === 'colocacion') {
     $('#capTitulo').textContent = 'Colocar bandera';
     $('#capDatos').hidden = false; $('#capResumen').hidden = true;
-    ['#cLocalidad', '#cVia', '#cColoco'].forEach(s => $(s).required = true);
+    ['#cLocalidad', '#cColoco'].forEach(s => $(s).required = true);
     $('#cLocalidad').value = localStorage.getItem(LOCALIDAD_KEY) || ''; // si ya no está en el catálogo, queda sin elegir
     $('#cColoco').value = sesion?.nombre || '';
-    $('#lblFoto span').textContent = '📷 Tomar foto de la bandera colocada';
+    $('#cVias').innerHTML = '';
+    agregarFilaVia();
   } else {
-    $('#capTitulo').textContent = 'Retirar bandera';
+    $('#capTitulo').textContent = registros.length > 1 ? `Retirar ${registros.length} banderas` : 'Retirar bandera';
     $('#capDatos').hidden = true; $('#capResumen').hidden = false;
-    ['#cLocalidad', '#cVia', '#cColoco'].forEach(s => $(s).required = false);
-    $('#capResumen').innerHTML = `<b>${esc(lugar(registro))}</b><br>Colocada: ${fechaHora(registro.colocacion.ms)} por ${esc(colocoDe(registro))}<br>
-      Folio: ${esc(registro.folio)}<br>Tiempo colocada: <b id="capTiempo" data-desde="${registro.colocacion.ms}">${duracion(Date.now() - registro.colocacion.ms)}</b>`;
-    $('#lblFoto span').textContent = '📷 Tomar foto del retiro';
+    ['#cLocalidad', '#cColoco'].forEach(s => $(s).required = false);
+    const desde = Math.min(...registros.map(r => r.colocacion.ms));
+    $('#capResumen').innerHTML = `<b>${esc(registros[0].localidad || registros[0].ubicacion)}</b><br>
+      ${registros.map(r => `${esc([viaDe(r), r.equipo].filter(Boolean).join(' · ') || '—')} · ${esc(r.folio)}`).join('<br>')}<br>
+      Colocada: ${fechaHora(desde)} por ${esc(colocoDe(registros[0]))}<br>
+      Tiempo colocada: <b id="capTiempo" data-desde="${desde}">${duracion(Date.now() - desde)}</b>`;
   }
+  pintarFotosCaptura();
   $('#dlgCaptura').showModal();
 }
 
-// Antes de abrir la cámara para una colocación: datos completos y vía libre. La revisión de la vía
-// es asíncrona y la cámara solo abre con un toque directo, así que si aún no está lista se pide
-// volver a tocar.
+// Miniaturas de las fotos tomadas en el formulario, cada una con su ✕.
+function pintarFotosCaptura() {
+  const fotos = captura?.fotos || [];
+  [...$('#capFotos').querySelectorAll('img')].forEach(i => URL.revokeObjectURL(i.src));
+  $('#capFotos').innerHTML = fotos.map((f, i) => `<figure>
+      <img src="${URL.createObjectURL(f.blob)}" alt="Foto ${i + 1}">
+      <button type="button" class="quitar-foto" data-quitar-foto="${i}" aria-label="Quitar foto ${i + 1}">✕</button>
+    </figure>`).join('');
+  const palabra = captura?.tipo === 'retiro' ? 'del retiro' : 'de la bandera colocada';
+  $('#lblFoto span').textContent = fotos.length ? `📷 Tomar otra foto (${fotos.length} de ${MAX_FOTOS})` : `📷 Tomar foto ${palabra}`;
+  $('#lblFoto').hidden = fotos.length >= MAX_FOTOS;
+  $('#btnGuardar').disabled = !fotos.length;
+  if (captura?.tipo === 'colocacion') pintarFilasVia();
+}
+$('#capFotos').addEventListener('click', e => {
+  const i = e.target.dataset.quitarFoto;
+  if (i == null) return;
+  captura.fotos.splice(Number(i), 1);
+  if (!captura.fotos.length) captura.folios = null; // sin fotos se pueden volver a cambiar las vías
+  pintarFotosCaptura();
+});
+
+// Antes de abrir la cámara para una colocación: datos completos y vías libres. La revisión de las
+// vías es asíncrona y la cámara solo abre con un toque directo, así que si aún no está lista se
+// pide volver a tocar.
 $('#lblFoto').addEventListener('click', e => {
-  if (captura?.tipo !== 'colocacion') return;
-  const falta = [['#cLocalidad', 'la localidad'], ['#cVia', 'la vía'], ['#cColoco', 'quién colocó la bandera']]
-    .find(([s]) => !$(s).value.trim());
-  if (falta) { e.preventDefault(); avisar(`Primero indica ${falta[1]}.`); $(falta[0]).focus(); return; }
-  const k = `${clave($('#cLocalidad').value)}|${clave($('#cVia').value)}`;
-  if (revisionVia.clave !== k || revisionVia.estado === 'verificando' || revisionVia.estado === 'pendiente') {
+  if (captura?.tipo !== 'colocacion' || captura.fotos.length) return; // las vías ya se revisaron con la primera foto
+  const vias = viasCapturadas();
+  const faltaLoc = !$('#cLocalidad').value.trim(), faltaColoco = !$('#cColoco').value.trim();
+  if (faltaLoc || !vias.length || faltaColoco) {
     e.preventDefault();
-    $('#capEstado').textContent = 'Revisando si hay otra bandera abierta en esta vía…';
+    avisar(`Primero indica ${faltaLoc ? 'la localidad' : !vias.length ? 'la vía' : 'quién colocó la bandera'}.`);
+    (faltaLoc ? $('#cLocalidad') : !vias.length ? $('#cVias .c-via') : $('#cColoco')).focus();
+    return;
+  }
+  const repetida = vias.find((v, i) => vias.findIndex(w => clave(w.via) === clave(v.via)) !== i);
+  if (repetida) { e.preventDefault(); avisar(`La vía "${repetida.via}" está repetida.`); return; }
+  if (revisionVia.clave !== claveRevision() || revisionVia.estado === 'verificando' || revisionVia.estado === 'pendiente') {
+    e.preventDefault();
+    $('#capEstado').textContent = 'Revisando si hay banderas abiertas en estas vías…';
     revisarVia().then(r => {
-      $('#capEstado').textContent = r.estado === 'libre' ? 'Vía libre. Toca de nuevo "Tomar foto".' : '';
+      $('#capEstado').textContent = r.estado === 'libre' ? 'Vías libres. Toca de nuevo "Tomar foto".' : '';
     });
     return;
   }
@@ -550,7 +675,7 @@ $('#lblFoto').addEventListener('click', e => {
 $('#cFoto').addEventListener('change', async e => {
   const archivo = e.target.files[0];
   e.target.value = '';
-  if (!archivo) return;
+  if (!archivo || !captura) return;
   const ms = Date.now();
   if (archivo.lastModified && ms - archivo.lastModified > ANTIGUEDAD_MAX_MS) {
     $('#capEstado').textContent = '⚠ Esa foto no es reciente. Toma la foto en este momento con la cámara.';
@@ -560,50 +685,63 @@ $('#cFoto').addEventListener('change', async e => {
   $('#btnGuardar').disabled = true;
   try {
     const gps = await obtenerGPS();
-    const r = captura.registro;
-    const folio = captura.tipo === 'colocacion' ? (captura.folio ||= siguienteFolio(ms)) : r.folio;
+    let info;
+    if (captura.tipo === 'colocacion') {
+      const vias = viasCapturadas();
+      captura.folios ||= vias.map(() => siguienteFolio(ms));
+      info = {
+        localidad: $('#cLocalidad').value.trim(), vias, coloco: $('#cColoco').value.trim(), folios: captura.folios,
+      };
+    } else {
+      const rs = captura.registros, desde = Math.min(...rs.map(r => r.colocacion.ms));
+      info = {
+        localidad: rs[0].localidad || rs[0].ubicacion, vias: rs.map(r => ({ via: r.localidad ? viaDe(r) : '', equipo: r.equipo })),
+        coloco: colocoDe(rs[0]), folios: rs.map(r => r.folio), tiempo: ms - desde, desde,
+      };
+    }
     const blob = await fotoConMarca(archivo, {
-      tipo: captura.tipo, ms, folio, gps, reporta: sesion?.nombre || 'Sin nombre',
-      localidad: captura.tipo === 'colocacion' ? $('#cLocalidad').value.trim() : (r.localidad || r.ubicacion),
-      via: captura.tipo === 'colocacion' ? $('#cVia').value.trim() : (r.localidad ? viaDe(r) : ''),
-      equipo: captura.tipo === 'colocacion' ? $('#cEquipo').value.trim() : r.equipo,
-      coloco: captura.tipo === 'colocacion' ? $('#cColoco').value.trim() : colocoDe(r),
-      tiempo: r ? ms - r.colocacion.ms : 0, desde: r ? r.colocacion.ms : 0,
+      ...info, tipo: captura.tipo, ms, gps, reporta: sesion?.nombre || 'Sin nombre',
+      numero: captura.fotos.length + 1,
     });
-    Object.assign(captura, { blob, ms, gps, folio });
-    const v = $('#capVista');
-    if (v.src) URL.revokeObjectURL(v.src);
-    v.src = URL.createObjectURL(blob); v.hidden = false;
-    $('#capEstado').textContent = 'Revisa la foto. Si está bien, presiona Guardar.';
-    $('#lblFoto span').textContent = '📷 Repetir foto';
-    $('#btnGuardar').disabled = false;
+    captura.fotos.push({ blob, ms, gps });
+    $('#capEstado').textContent = captura.fotos.length < MAX_FOTOS
+      ? 'Puedes tomar otra foto o presionar Guardar.' : 'Ya tienes el máximo de fotos. Presiona Guardar.';
+    pintarFotosCaptura();
   } catch (err) {
     console.error(err);
     $('#capEstado').textContent = 'No se pudo procesar la foto: ' + err.message;
+    $('#btnGuardar').disabled = !captura.fotos.length;
   }
 });
 
 $('#btnGuardar').addEventListener('click', async () => {
-  if (!captura?.blob) return;
+  if (!captura?.fotos.length) return;
+  const blobs = captura.fotos.map(f => f.blob), primera = captura.fotos[0];
   if (captura.tipo === 'colocacion') {
-    // Pudieron colocar otra en la misma vía mientras se tomaba la foto.
+    // Pudieron colocar otra en alguna de las vías mientras se tomaban las fotos.
     if ((await revisarVia()).estado === 'bloqueada') { $('#capBloqueo').scrollIntoView({ behavior: 'smooth' }); return; }
-    await guardar({
-      id: captura.folio, folio: captura.folio, localidad: $('#cLocalidad').value.trim(), localidadId: localidadIdElegida(),
-      via: $('#cVia').value.trim(),
-      equipo: $('#cEquipo').value.trim(), coloco: $('#cColoco').value.trim(), obs: $('#cObs').value.trim(),
-      colocacion: { ms: captura.ms, foto: captura.blob, gps: captura.gps, responsable: sesion.nombre },
-      retiro: null, cierre: null,
-      remotoId: crypto.randomUUID(), usuarioId: sesion.usuarioId, enviado: { colocacion: false, retiro: false, cierre: false },
-    });
+    const vias = viasCapturadas(), reporteId = crypto.randomUUID();
+    for (const [i, v] of vias.entries()) {
+      const folio = captura.folios[i];
+      await guardar({
+        id: folio, folio, localidad: $('#cLocalidad').value.trim(), localidadId: localidadIdElegida(),
+        via: v.via, equipo: v.equipo, coloco: $('#cColoco').value.trim(), obs: $('#cObs').value.trim(), reporteId,
+        colocacion: { ms: primera.ms, foto: blobs[0], fotos: blobs, gps: primera.gps, responsable: sesion.nombre },
+        retiro: null, cierre: null,
+        remotoId: crypto.randomUUID(), usuarioId: sesion.usuarioId, enviado: { colocacion: false, retiro: false, cierre: false },
+      });
+    }
     localStorage.setItem(LOCALIDAD_KEY, $('#cLocalidad').value.trim());
-    avisar('Bandera registrada como colocada. El tiempo empieza a contar.');
+    avisar(vias.length > 1 ? `${vias.length} banderas registradas como colocadas.` : 'Bandera registrada como colocada. El tiempo empieza a contar.');
   } else {
-    const r = captura.registro;
-    r.retiro = { ms: captura.ms, foto: captura.blob, gps: captura.gps, responsable: sesion.nombre };
-    r.duracionMs = captura.ms - r.colocacion.ms;
-    await guardar(r);
-    avisar(`Bandera retirada. Tiempo colocada: ${duracion(r.duracionMs)}`, 5000);
+    const grupoId = crypto.randomUUID(); // las fotos del retiro se suben una vez para todas
+    for (const r of captura.registros) {
+      r.retiro = { ms: primera.ms, foto: blobs[0], fotos: blobs, gps: primera.gps, responsable: sesion.nombre, grupoId };
+      r.duracionMs = primera.ms - r.colocacion.ms;
+      await guardar(r);
+    }
+    const n = captura.registros.length;
+    avisar(n > 1 ? `${n} banderas retiradas.` : `Bandera retirada. Tiempo colocada: ${duracion(captura.registros[0].duracionMs)}`, 5000);
   }
   captura = null;
   $('#dlgCaptura').close();
@@ -615,11 +753,16 @@ $('#btnCancelar').addEventListener('click', () => { captura = null; $('#dlgCaptu
 // ---------- Vistas ----------
 let registros = [];
 const urls = new Map(); // id+tipo -> objectURL de la foto
-function urlFoto(r, tipo) {
-  if (!r[tipo]?.foto) return '';
-  const k = r.id + tipo;
-  if (!urls.has(k)) urls.set(k, URL.createObjectURL(r[tipo].foto));
+function urlFoto(r, tipo, i = 0) {
+  const blob = fotosLocal(r, tipo)[i];
+  if (!blob) return '';
+  const k = `${r.id}|${tipo}|${i}`;
+  if (!urls.has(k)) urls.set(k, URL.createObjectURL(blob));
   return urls.get(k);
+}
+function figurasFotos(r, tipo) {
+  const fotos = fotosLocal(r, tipo), nombre = tipo === 'colocacion' ? 'Colocación' : 'Retiro';
+  return fotos.map((_, i) => `<figure><img src="${urlFoto(r, tipo, i)}" data-foto="${esc(r.id)}|${tipo}|${i}" alt="Foto de ${nombre.toLowerCase()} ${i + 1}"><figcaption>${nombre}${fotos.length > 1 ? ` ${i + 1}` : ''}</figcaption></figure>`).join('');
 }
 
 function etiquetaEnvio(r) {
@@ -632,17 +775,18 @@ function etiquetaEnvio(r) {
   return pendiente(r) ? '<span class="envio">⏳ Pendiente de enviar a Shop Car</span>' : '<span class="envio ok">✓ Enviado a Shop Car</span>';
 }
 
-function tarjetaActiva(r) {
+function tarjetaActiva(r, hermanas = 0) {
   return `<div class="tarjeta bandera" data-id="${esc(r.id)}">
     <div class="cab"><h3>${esc(lugar(r))}</h3><span class="folio">${esc(r.folio)}</span></div>
     <div class="cronometro" data-desde="${r.colocacion.ms}">${duracion(Date.now() - r.colocacion.ms)}</div>
     <div class="meta">Colocada ${fechaHora(r.colocacion.ms)} · Colocó: ${esc(colocoDe(r))}
       ${r.obs ? `<br>${esc(r.obs)}` : ''}<br>${etiquetaEnvio(r)}</div>
-    ${r.colocacion.foto ? `<div class="fotos"><figure><img src="${urlFoto(r, 'colocacion')}" data-foto="${esc(r.id)}|colocacion" alt="Foto de colocación"><figcaption>Colocación</figcaption></figure></div>` : ''}
-    <button class="btn-retirar" data-retirar="${esc(r.id)}">Retirar bandera</button>
+    ${fotosLocal(r, 'colocacion').length ? `<div class="fotos">${figurasFotos(r, 'colocacion')}</div>` : ''}
+    <button class="btn-retirar" data-retirar="${esc(r.id)}">Retirar ${hermanas ? 'solo esta vía' : 'bandera'}</button>
+    ${hermanas ? `<button class="btn-retirar todas" data-retirar-grupo="${esc(r.reporteId)}">Retirar las ${hermanas + 1} vías de este reporte</button>` : ''}
   </div>`;
 }
-function tarjetaRemota(b) {
+function tarjetaRemota(b, hermanas = 0) {
   const ms = new Date(b.colocada_at).getTime();
   return `<div class="tarjeta bandera remota">
     <div class="cab"><h3>${esc([b.localidad, b.via ?? b.via_equipo, b.equipo].filter(Boolean).join(' · '))}</h3><span class="folio">${esc(b.folio)}</span></div>
@@ -650,7 +794,8 @@ function tarjetaRemota(b) {
     <div class="meta">Colocada ${fechaHora(ms)} · Colocó: ${esc(b.responsable)}
       ${b.observaciones ? `<br>${esc(b.observaciones)}` : ''}<br>
       <span class="envio">📡 Colocada desde otro teléfono o desde la app anterior</span></div>
-    <button class="btn-retirar" data-retirar-remota="${esc(b.id)}">Retirar bandera</button>
+    <button class="btn-retirar" data-retirar-remota="${esc(b.id)}">Retirar ${hermanas ? 'solo esta vía' : 'bandera'}</button>
+    ${hermanas ? `<button class="btn-retirar todas" data-retirar-remota-grupo="${esc(b.reporte_id)}">Retirar las ${hermanas + 1} vías de este reporte</button>` : ''}
   </div>`;
 }
 function tarjetaHistorial(r) {
@@ -666,8 +811,8 @@ function tarjetaHistorial(r) {
       ${r.obs ? `<br>${esc(r.obs)}` : ''}<br>${etiquetaEnvio(r)}
     </div>
     <div class="fotos">
-      ${r.colocacion.foto ? `<figure><img src="${urlFoto(r, 'colocacion')}" data-foto="${esc(r.id)}|colocacion" alt="Foto de colocación"><figcaption>Colocación</figcaption></figure>` : ''}
-      ${r.retiro ? `<figure><img src="${urlFoto(r, 'retiro')}" data-foto="${esc(r.id)}|retiro" alt="Foto de retiro"><figcaption>Retiro</figcaption></figure>` : ''}
+      ${figurasFotos(r, 'colocacion')}
+      ${r.retiro ? figurasFotos(r, 'retiro') : ''}
     </div>
     ${pendiente(r) ? '' : `<button class="borrar" data-borrar="${esc(r.id)}">Quitar de este teléfono</button>`}
   </div>`;
@@ -688,8 +833,9 @@ async function pintar() {
   const deShopCar = sesion && !MUDANZA ? remotas.filter(b => !enTelefono.has(b.id)) : [];
   $('#numActivas').textContent = activas.length + deShopCar.length;
   $('#listaActivas').innerHTML = activas.length || deShopCar.length
-    ? activas.map(tarjetaActiva).join('') +
-      (deShopCar.length ? `<h2 class="subtitulo">Colocadas desde otro teléfono (${deShopCar.length})</h2>` + deShopCar.map(tarjetaRemota).join('') : '')
+    ? activas.map(r => tarjetaActiva(r, r.reporteId ? activas.filter(x => x.reporteId === r.reporteId).length - 1 : 0)).join('') +
+      (deShopCar.length ? `<h2 class="subtitulo">Colocadas desde otro teléfono (${deShopCar.length})</h2>` +
+        deShopCar.map(b => tarjetaRemota(b, b.reporte_id ? deShopCar.filter(x => x.reporte_id === b.reporte_id).length - 1 : 0)).join('') : '')
     : '<p class="vacio">No hay banderas colocadas en este momento.</p>';
 
   const hist = filtrados();
@@ -733,9 +879,13 @@ setInterval(tic, 1000);
 document.addEventListener('click', async e => {
   const t = e.target;
   if (t.dataset.retirar) abrirCaptura('retiro', registros.find(r => r.id === t.dataset.retirar));
+  else if (t.dataset.retirarGrupo) abrirCaptura('retiro', registros.filter(r => abierta(r) && r.reporteId === t.dataset.retirarGrupo));
   else if (t.dataset.retirarRemota) {
     const b = remotas.find(x => x.id === t.dataset.retirarRemota);
     if (b && sesion) abrirCaptura('retiro', registroDeRemota(b));
+  } else if (t.dataset.retirarRemotaGrupo && sesion) {
+    const enTelefono = new Set(registros.map(r => r.remotoId));
+    abrirCaptura('retiro', remotas.filter(b => b.reporte_id === t.dataset.retirarRemotaGrupo && !enTelefono.has(b.id)).map(registroDeRemota));
   }
   else if (t.dataset.foto) verFoto(...t.dataset.foto.split('|'));
   else if (t.dataset.conflicto) resolverConflicto(registros.find(r => r.id === t.dataset.conflicto));
@@ -744,7 +894,7 @@ document.addEventListener('click', async e => {
     const aviso = r.usuarioId ? ' En Shop Car el registro se conserva.' : ' No se puede deshacer.';
     if (confirm(`¿Quitar de este teléfono el registro ${r.folio} (${lugar(r)}) y sus fotos?${aviso}`)) {
       await borrar(r.id);
-      ['colocacion', 'retiro'].forEach(k => { URL.revokeObjectURL(urls.get(r.id + k)); urls.delete(r.id + k); });
+      for (const [k, u] of urls) if (k.startsWith(`${r.id}|`)) { URL.revokeObjectURL(u); urls.delete(k); }
       pintar();
     }
   }
@@ -841,10 +991,11 @@ async function resolverConflicto(r) {
 }
 
 let fotoActual = null;
-function verFoto(id, tipo) {
+function verFoto(id, tipo, i = 0) {
   const r = registros.find(x => x.id === id);
-  fotoActual = { blob: r[tipo].foto, nombre: `${r.folio}_${tipo}.jpg` };
-  $('#visorImg').src = urlFoto(r, tipo);
+  i = Number(i);
+  fotoActual = { blob: fotosLocal(r, tipo)[i], nombre: `${r.folio}_${tipo}_${i + 1}.jpg` };
+  $('#visorImg').src = urlFoto(r, tipo, i);
   $('#btnCompartir').hidden = !navigator.canShare;
   $('#dlgFoto').showModal();
 }

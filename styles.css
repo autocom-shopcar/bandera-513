@@ -151,3 +151,20 @@ button.estado-envio { display: block; width: 100%; border: 0; font: inherit; fon
 .pasos-mudanza { padding-left: 20px; line-height: 1.6; }
 .subtitulo { font-size: 15px; color: var(--tenue); margin: 18px 0 8px; }
 .bandera.remota { border-left-color: #8a96ad; background: #f7f9fc; }
+.campo-vias { margin-bottom: 12px; }
+.campo-vias .etiqueta { display: block; font-size: 14px; color: var(--tenue); margin-bottom: 4px; }
+.fila-via { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+.fila-via input { margin-top: 0; }
+.fila-via .c-via { flex: 1 1 40%; }
+.fila-via .c-equipo { flex: 1 1 60%; }
+.fila-via .quitar-via { border: 0; background: none; color: var(--tenue); font-size: 18px; padding: 4px 6px; cursor: pointer; }
+.cap-fotos { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 6px 0; }
+.cap-fotos figure { position: relative; margin: 0; }
+.cap-fotos img { width: 100%; aspect-ratio: 3/4; object-fit: cover; object-position: bottom; border-radius: 8px; border: 1px solid var(--borde); }
+.cap-fotos .quitar-foto {
+  position: absolute; top: 4px; right: 4px; border: 0; border-radius: 50%; width: 26px; height: 26px;
+  background: rgba(0,0,0,.65); color: #fff; font-size: 14px; cursor: pointer;
+}
+.btn-retirar.todas { background: #8e1c1c; }
+.fotos { flex-wrap: wrap; }
+.fotos figure { flex: 0 0 calc(33% - 6px); }
